@@ -7,12 +7,17 @@ import dotenv from 'dotenv';
 import rateLimit from 'express-rate-limit';
 import { body, validationResult } from 'express-validator';
 import { initDB, getDB, bookSlot, cancelBooking, getSlotStatus, getSlotWaitlist } from './db.js';
+import { authMiddleware, checkRole, logAudit } from './middleware/rbac.js';
 
 // Load environment variables
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 4000;
+
+// Initialize database
+const db = await initDB();
+app.locals.db = db;
 
 // Basic security
 app.use(cors());
@@ -34,30 +39,17 @@ const cancelLimiter = rateLimit({
 
 // In-memory data
 const users = [
-  { id: 'u1', name: 'Alice', email: 'alice@example.com', passwordHash: bcrypt.hashSync('password', 8), role: 'student' },
-  { id: 'u2', name: 'Bob', email: 'bob@example.com', passwordHash: bcrypt.hashSync('password', 8), role: 'student' },
-  { id: 'u3', name: 'Carol', email: 'carol@example.com', passwordHash: bcrypt.hashSync('password', 8), role: 'student' },
-  { id: 'u4', name: 'TA Tim', email: 'ta@example.com', passwordHash: bcrypt.hashSync('password', 8), role: 'ta' },
-  { id: 'u5', name: 'Admin Ada', email: 'admin@example.com', passwordHash: bcrypt.hashSync('admin', 8), role: 'admin' }
+  { id: 'u1', name: 'Alice', email: 'alice@example.com', passwordHash: bcrypt.hashSync('password', 8), role: 'STUDENT' },
+  { id: 'u2', name: 'Bob', email: 'bob@example.com', passwordHash: bcrypt.hashSync('password', 8), role: 'STUDENT' },
+  { id: 'u3', name: 'Carol', email: 'carol@example.com', passwordHash: bcrypt.hashSync('password', 8), role: 'STUDENT' },
+  { id: 'u4', name: 'TA Tim', email: 'ta@example.com', passwordHash: bcrypt.hashSync('password', 8), role: 'TA' },
+  { id: 'u5', name: 'Admin Ada', email: 'admin@example.com', passwordHash: bcrypt.hashSync('admin', 8), role: 'ADMIN' }
 ];
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
 function signToken(user) {
   return jwt.sign({ sub: user.id, role: user.role, name: user.name, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
-}
-
-function authMiddleware(req, res, next) {
-  const auth = req.headers.authorization || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
-  try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
-    next();
-  } catch (e) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
 }
 
 // resources each with capacity (number of identical units)
@@ -289,40 +281,45 @@ app.post('/api/admin/resources', [
   const { name, capacity } = req.body;
 
   try {
-    await db.transaction(async () => {
-      // Create resource
-      const resourceId = nanoid(8);
-      await db.run(
-        'INSERT INTO resources (id, name, capacity) VALUES (?, ?, ?)',
-        resourceId, name, Number(capacity)
-      );
+    await db.run('BEGIN TRANSACTION');
+    
+    // Create resource
+    const resourceId = nanoid(8);
+    await db.run(
+      'INSERT INTO resources (id, name, capacity) VALUES (?, ?, ?)',
+      resourceId, name, Number(capacity)
+    );
 
-      // Generate slots for current week
-      const now = new Date();
-      const weekStart = startOfWeek(now);
-      const hours = [8, 10, 12, 14, 16, 18];
-      
-      for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
-        for (const h of hours) {
-          const start = new Date(weekStart);
-          start.setDate(start.getDate() + dayOffset);
-          start.setHours(h, 0, 0, 0);
-          const end = new Date(start);
-          end.setHours(h + 2);
-          
-          await db.run(
-            `INSERT INTO slots (id, resourceId, start, end, blocked) 
-             VALUES (?, ?, ?, ?, ?)`,
-            nanoid(10), resourceId, start.toISOString(), end.toISOString(), false
-          );
-        }
+    // Generate slots for current week
+    const now = new Date();
+    const weekStart = new Date(now);
+    weekStart.setHours(0, 0, 0, 0);
+    weekStart.setDate(weekStart.getDate() - weekStart.getDay()); // Start from Sunday
+    const hours = [8, 10, 12, 14, 16, 18];
+    
+    for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
+      for (const h of hours) {
+        const start = new Date(weekStart);
+        start.setDate(start.getDate() + dayOffset);
+        start.setHours(h, 0, 0, 0);
+        const end = new Date(start);
+        end.setHours(h + 2);
+        
+        await db.run(
+          `INSERT INTO slots (id, resourceId, start, end, blocked) 
+           VALUES (?, ?, ?, ?, ?)`,
+          nanoid(10), resourceId, start.toISOString(), end.toISOString(), false
+        );
       }
+    }
 
-      const resource = await db.get('SELECT * FROM resources WHERE id = ?', resourceId);
-      await logAudit(req.user.id, 'RESOURCE_CREATED', resourceId, { name, capacity });
-      res.json(resource);
-    });
+    const resource = await db.get('SELECT * FROM resources WHERE id = ?', resourceId);
+    await logAudit(req.user.id, 'RESOURCE_CREATED', resourceId, { name, capacity });
+    
+    await db.run('COMMIT');
+    res.json(resource);
   } catch (err) {
+    await db.run('ROLLBACK');
     console.error('Resource create error:', err);
     res.status(500).json({ error: 'Failed to create resource', code: 'INTERNAL_ERROR' });
   }

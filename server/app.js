@@ -2,13 +2,14 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import { initDB } from './db.js';
 import { handleError } from './errors.js';
-import { authMiddleware, roleCheck } from './middleware.js';
+import { authMiddleware, requireRole, guardCapacityChange, guardAnalytics, auditLog } from './middleware/rbac.js';
 
 const app = express();
 app.use(express.json());
 
-// Initialize database connection
+// Initialize database connection and attach to app
 const db = await initDB();
+app.locals.db = db;
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -16,10 +17,14 @@ app.use((err, req, res, next) => {
 });
 
 // Authentication middleware for protected routes
+// Apply auth middleware to all /api routes
 app.use('/api', authMiddleware);
 
+// Apply additional admin role check to all /api/admin routes
+app.use('/api/admin', requireRole('ADMIN'));
+
 // Resource management endpoints (admin only)
-app.post('/api/admin/resources', roleCheck('admin'), async (req, res) => {
+app.post('/api/admin/resources', auditLog('create_resource'), async (req, res) => {
   const { name, capacity } = req.body;
   try {
     const result = await db.run(
@@ -171,7 +176,7 @@ app.get('/api/admin/rules', roleCheck(['admin', 'ta']), async (req, res) => {
   }
 });
 
-app.post('/api/admin/rules', roleCheck('admin'), async (req, res) => {
+app.post('/api/admin/rules', requireRole('ADMIN'), auditLog('create_rule'), async (req, res) => {
   const { resourceId, dayOfWeek, startHour, endHour, label } = req.body;
   
   try {
@@ -191,6 +196,53 @@ app.post('/api/admin/rules', roleCheck('admin'), async (req, res) => {
     `, label, resourceId, dayOfWeek, startHour, endHour);
     
     res.json({ id: result.lastID });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Analytics endpoints (admin only)
+app.get('/api/analytics/resources', requireRole('ADMIN'), async (req, res) => {
+  try {
+    const analytics = await db.all('SELECT * FROM resourceAnalytics');
+    res.json(analytics);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/analytics/resource/:id', requireRole('ADMIN'), async (req, res) => {
+  try {
+    const analytics = await db.get('SELECT * FROM resourceAnalytics WHERE resourceId = ?', req.params.id);
+    if (!analytics) {
+      return res.status(404).json({ error: 'Resource not found' });
+    }
+    res.json(analytics);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/analytics/waitlist', requireRole('ADMIN'), async (req, res) => {
+  try {
+    const stats = await db.all(`
+      SELECT 
+        r.id as resourceId,
+        r.name as resourceName,
+        s.id as slotId,
+        s.start,
+        s.end,
+        COUNT(CASE WHEN b.status = 'waitlisted' THEN 1 END) as waitlistCount,
+        MAX(b.waitlistPosition) as maxWaitlistPosition
+      FROM resources r
+      JOIN slots s ON s.resourceId = r.id
+      LEFT JOIN bookings b ON b.slotId = s.id
+      WHERE b.status = 'waitlisted'
+      GROUP BY r.id, r.name, s.id
+      HAVING waitlistCount > 0
+      ORDER BY waitlistCount DESC
+    `);
+    res.json(stats);
   } catch (err) {
     next(err);
   }

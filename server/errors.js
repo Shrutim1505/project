@@ -1,5 +1,13 @@
 // Error types with codes and default messages
 export const ErrorTypes = {
+  UNAUTHORIZED: {
+    code: 'UNAUTHORIZED',
+    message: 'Authentication required'
+  },
+  FORBIDDEN: {
+    code: 'FORBIDDEN',
+    message: 'Access denied'
+  },
   OVERLAP_CONFLICT: {
     code: 'OVERLAP_CONFLICT',
     message: 'Cannot book overlapping slots'

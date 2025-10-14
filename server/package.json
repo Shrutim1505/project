@@ -6,9 +6,10 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test": "DB_URL=:memory: node --test tests/",
-    "test:watch": "DB_URL=:memory: node --test --watch tests/",
-    "coverage": "DB_URL=:memory: node --test --experimental-test-coverage tests/"
+    "migrate": "node migrations/001_add_role_column.js",
+    "test": "DB_URL=:memory: node migrations/001_add_role_column.js && node --test tests/",
+    "test:watch": "DB_URL=:memory: node migrations/001_add_role_column.js && node --test --watch tests/",
+    "coverage": "DB_URL=:memory: node migrations/001_add_role_column.js && node --test --experimental-test-coverage tests/"
   },
   "dependencies": {
     "cors": "^2.8.5",
