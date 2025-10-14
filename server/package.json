@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test": "node --test tests/"
+    "test": "DB_URL=:memory: node --test tests/",
+    "test:watch": "DB_URL=:memory: node --test --watch tests/",
+    "coverage": "DB_URL=:memory: node --test --experimental-test-coverage tests/"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -16,12 +18,15 @@
     "jsonwebtoken": "^9.0.2",
     "sqlite3": "^5.1.7",
     "sqlite": "^5.1.1",
+    "supertest": "^6.3.4",
     "dotenv": "^16.4.1",
     "express-rate-limit": "^7.1.5",
     "express-validator": "^7.0.1"
   },
   "devDependencies": {
-    "@types/node": "^20.11.16"
+    "@types/node": "^20.11.16",
+    "@types/supertest": "^6.0.2",
+    "supertest": "^6.3.4"
   }
 }
 

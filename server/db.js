@@ -68,6 +68,32 @@ export async function initDB() {
       timestamp TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (actorId) REFERENCES users(id)
     );
+
+    CREATE TABLE IF NOT EXISTS recurringRules (
+      id TEXT PRIMARY KEY,
+      resourceId TEXT NOT NULL,
+      dayOfWeek INTEGER NOT NULL CHECK (dayOfWeek BETWEEN 1 AND 7),
+      startHour INTEGER NOT NULL CHECK (startHour BETWEEN 0 AND 23),
+      endHour INTEGER NOT NULL CHECK (endHour BETWEEN 1 AND 24),
+      label TEXT NOT NULL,
+      createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      createdBy TEXT NOT NULL,
+      FOREIGN KEY (resourceId) REFERENCES resources(id) ON DELETE CASCADE,
+      FOREIGN KEY (createdBy) REFERENCES users(id),
+      CHECK (endHour > startHour)
+    );
+
+    CREATE TABLE IF NOT EXISTS blackoutDates (
+      id TEXT PRIMARY KEY,
+      resourceId TEXT NOT NULL,
+      start TEXT NOT NULL,
+      end TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      createdAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      createdBy TEXT NOT NULL,
+      FOREIGN KEY (resourceId) REFERENCES resources(id) ON DELETE CASCADE,
+      FOREIGN KEY (createdBy) REFERENCES users(id)
+    );
   `);
 
   return _db;

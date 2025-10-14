@@ -37,8 +37,18 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedResourceId) return;
+    
+    // Fetch slots with computed status
     fetch(`${API_URL}/api/slots?resourceId=${selectedResourceId}`).then(r => r.json()).then(setSlots);
-  }, [selectedResourceId]);
+
+    // If admin/TA, also fetch recurring rules
+    if (auth?.user?.role === 'admin' || auth?.user?.role === 'ta') {
+      fetch(`${API_URL}/api/admin/rules?resourceId=${selectedResourceId}`)
+        .then(r => r.ok ? r.json() : [])
+        .then(rules => console.log('Recurring rules:', rules))
+        .catch(console.error);
+    }
+  }, [selectedResourceId, auth?.user?.role]);
 
   useSSE((_event, data) => {
     if (selectedResourceId) {

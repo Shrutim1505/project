@@ -396,6 +396,133 @@ app.delete('/api/admin/resources/:id', [
   }
 });
 
+// Recurring rules endpoints
+app.get('/api/admin/rules', [
+  authMiddleware,
+  checkRole('ta')
+], async (req, res) => {
+  const { resourceId } = req.query;
+  const db = await getDB();
+
+  try {
+    const rules = await db.all(
+      `SELECT r.*, u.name as createdByName
+       FROM recurringRules r
+       JOIN users u ON r.createdBy = u.id
+       ${resourceId ? 'WHERE r.resourceId = ?' : ''}
+       ORDER BY r.dayOfWeek, r.startHour`,
+      resourceId ? [resourceId] : []
+    );
+    res.json(rules);
+  } catch (err) {
+    console.error('Rules list error:', err);
+    res.status(500).json({ error: 'Failed to list rules', code: 'INTERNAL_ERROR' });
+  }
+});
+
+app.post('/api/admin/rules', [
+  authMiddleware,
+  checkRole('admin'),
+  body('resourceId').notEmpty(),
+  body('dayOfWeek').isInt({ min: 1, max: 7 }),
+  body('startHour').isFloat({ min: 0, max: 23 }),
+  body('endHour').isFloat({ min: 1, max: 24 }),
+  body('label').trim().notEmpty()
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid input', details: errors.array() });
+  }
+
+  try {
+    const rule = await addRecurringRule(
+      req.body.resourceId,
+      {
+        dayOfWeek: req.body.dayOfWeek,
+        startHour: req.body.startHour,
+        endHour: req.body.endHour,
+        label: req.body.label
+      },
+      req.user.id
+    );
+
+    await logAudit(req.user.id, 'RULE_CREATED', rule.id, req.body);
+    res.json(rule);
+  } catch (err) {
+    if (err.code) {
+      res.status(400).json({ error: err.message, code: err.code });
+    } else {
+      console.error('Rule create error:', err);
+      res.status(500).json({ error: 'Failed to create rule', code: 'INTERNAL_ERROR' });
+    }
+  }
+});
+
+app.delete('/api/admin/rules/:id', [
+  authMiddleware,
+  checkRole('admin')
+], async (req, res) => {
+  const db = await getDB();
+  const { id } = req.params;
+
+  try {
+    await db.transaction(async () => {
+      const rule = await db.get('SELECT * FROM recurringRules WHERE id = ?', id);
+      if (!rule) {
+        return res.status(404).json({ error: 'Rule not found', code: 'NOT_FOUND' });
+      }
+
+      await db.run('DELETE FROM recurringRules WHERE id = ?', id);
+      
+      // Regenerate affected slots
+      await generateWeekSlots(rule.resourceId, new Date());
+      
+      await logAudit(req.user.id, 'RULE_DELETED', id, { resourceId: rule.resourceId });
+      res.json({ ok: true });
+    });
+  } catch (err) {
+    console.error('Rule delete error:', err);
+    res.status(500).json({ error: 'Failed to delete rule', code: 'INTERNAL_ERROR' });
+  }
+});
+
+// Blackout dates endpoints
+app.post('/api/admin/blackouts', [
+  authMiddleware,
+  checkRole('admin'),
+  body('resourceId').notEmpty(),
+  body('start').isISO8601(),
+  body('end').isISO8601(),
+  body('reason').trim().notEmpty()
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid input', details: errors.array() });
+  }
+
+  try {
+    const blackout = await addBlackoutDate(
+      req.body.resourceId,
+      {
+        start: req.body.start,
+        end: req.body.end,
+        reason: req.body.reason
+      },
+      req.user.id
+    );
+
+    await logAudit(req.user.id, 'BLACKOUT_CREATED', blackout.id, req.body);
+    res.json(blackout);
+  } catch (err) {
+    if (err.code) {
+      res.status(400).json({ error: err.message, code: err.code });
+    } else {
+      console.error('Blackout create error:', err);
+      res.status(500).json({ error: 'Failed to create blackout', code: 'INTERNAL_ERROR' });
+    }
+  }
+});
+
 // ----- Admin: Usage Stats -----
 app.get('/api/admin/stats', (req, res) => {
   const byResource = {};
