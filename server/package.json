@@ -5,14 +5,23 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "node index.js"
+    "dev": "node --watch index.js",
+    "test": "node --test tests/"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "nanoid": "^5.0.7",
     "bcryptjs": "^2.4.3",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "sqlite3": "^5.1.7",
+    "sqlite": "^5.1.1",
+    "dotenv": "^16.4.1",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.16"
   }
 }
 

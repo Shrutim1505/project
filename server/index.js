@@ -3,12 +3,34 @@ import cors from 'cors';
 import { nanoid } from 'nanoid';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import dotenv from 'dotenv';
+import rateLimit from 'express-rate-limit';
+import { body, validationResult } from 'express-validator';
+import { initDB, getDB, bookSlot, cancelBooking, getSlotStatus, getSlotWaitlist } from './db.js';
+
+// Load environment variables
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Basic security
 app.use(cors());
 app.use(express.json());
+app.set('trust proxy', 1);
+
+// Rate limiting
+const bookingLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10, // 10 requests per minute
+  message: { error: 'Too many booking attempts' }
+});
+
+const cancelLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 3,
+  message: { error: 'Too many cancellation attempts' }
+});
 
 // In-memory data
 const users = [
@@ -105,92 +127,273 @@ function broadcast(event, data) {
 app.get('/api/users', (_req, res) => {
   res.json(users.map(u => ({ id: u.id, name: u.name, role: u.role, email: u.email })));
 });
-// Auth routes
-app.post('/api/auth/register', (req, res) => {
-  const { name, email, password, role } = req.body;
-  if (!name || !email || !password) return res.status(400).json({ error: 'Missing fields' });
-  if (users.find(u => u.email === email)) return res.status(400).json({ error: 'Email already registered' });
-  const user = { id: nanoid(8), name, email, passwordHash: bcrypt.hashSync(password, 8), role: role || 'student' };
-  users.push(user);
-  const token = signToken(user);
-  res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
-});
-
-app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body;
-  const user = users.find(u => u.email === email);
-  if (!user || !bcrypt.compareSync(password, user.passwordHash)) return res.status(401).json({ error: 'Invalid credentials' });
-  const token = signToken(user);
-  res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
-});
-
-app.get('/api/auth/me', authMiddleware, (req, res) => {
-  const user = users.find(u => u.id === req.user.sub);
-  if (!user) return res.status(404).json({ error: 'Not found' });
-  res.json({ id: user.id, name: user.name, email: user.email, role: user.role });
-});
-
-
-app.get('/api/resources', (_req, res) => {
-  res.json(resources);
-});
-
-app.get('/api/slots', (req, res) => {
-  const { resourceId } = req.query;
-  let result = Array.from(slots.values());
-  if (resourceId) {
-    result = result.filter(s => s.resourceId === resourceId);
+// Auth routes with validation
+app.post('/api/auth/register', [
+  body('name').trim().isLength({ min: 2 }),
+  body('email').trim().isEmail(),
+  body('password').isLength({ min: 6 }),
+  body('role').optional().isIn(['student', 'ta', 'admin'])
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid input', details: errors.array() });
   }
-  // Sort by start time
-  result.sort((a, b) => new Date(a.start) - new Date(b.start));
-  res.json(result);
+
+  const db = await getDB();
+  const { name, email, password, role = 'student' } = req.body;
+
+  try {
+    // Check email uniqueness with proper index
+    const existing = await db.get('SELECT 1 FROM users WHERE email = ?', email);
+    if (existing) {
+      return res.status(400).json({ error: 'Email already registered', code: 'EMAIL_TAKEN' });
+    }
+
+    // Create user in transaction
+    const userId = nanoid(8);
+    await db.run(
+      'INSERT INTO users (id, name, email, passwordHash, role) VALUES (?, ?, ?, ?, ?)',
+      userId, name, email, bcrypt.hashSync(password, 10), role
+    );
+
+    // Get created user
+    const user = await db.get(
+      'SELECT id, name, email, role FROM users WHERE id = ?',
+      userId
+    );
+
+    const token = jwt.sign(
+      { sub: user.id, role: user.role },
+      process.env.JWT_SECRET || 'dev-secret',
+      { expiresIn: '7d' }
+    );
+
+    await logAudit(userId, 'USER_REGISTERED', userId);
+    res.json({ token, user });
+  } catch (err) {
+    console.error('Register error:', err);
+    res.status(500).json({ error: 'Registration failed', code: 'INTERNAL_ERROR' });
+  }
+});
+
+app.post('/api/auth/login', [
+  body('email').trim().isEmail(),
+  body('password').isLength({ min: 1 })
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid input', details: errors.array() });
+  }
+
+  const db = await getDB();
+  const { email, password } = req.body;
+
+  try {
+    const user = await db.get(
+      'SELECT id, name, email, role, passwordHash FROM users WHERE email = ?',
+      email
+    );
+
+    if (!user || !bcrypt.compareSync(password, user.passwordHash)) {
+      return res.status(401).json({ error: 'Invalid credentials', code: 'INVALID_CREDENTIALS' });
+    }
+
+    const token = jwt.sign(
+      { sub: user.id, role: user.role },
+      process.env.JWT_SECRET || 'dev-secret',
+      { expiresIn: '7d' }
+    );
+
+    // Don't send passwordHash to client
+    const { passwordHash: _, ...safeUser } = user;
+    
+    await logAudit(user.id, 'USER_LOGIN', user.id);
+    res.json({ token, user: safeUser });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Login failed', code: 'INTERNAL_ERROR' });
+  }
+});
+
+app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  try {
+    const db = await getDB();
+    const user = await db.get(
+      'SELECT id, name, email, role FROM users WHERE id = ?',
+      req.user.id
+    );
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found', code: 'NOT_FOUND' });
+    }
+    
+    res.json(user);
+  } catch (err) {
+    console.error('Auth check error:', err);
+    res.status(500).json({ error: 'Server error', code: 'INTERNAL_ERROR' });
+  }
+});
+
+
+app.get('/api/resources', async (_req, res) => {
+  try {
+    const db = await getDB();
+    const resources = await db.all('SELECT * FROM resources ORDER BY name');
+    res.json(resources);
+  } catch (err) {
+    console.error('Resource list error:', err);
+    res.status(500).json({ error: 'Failed to list resources', code: 'INTERNAL_ERROR' });
+  }
+});
+
+app.get('/api/slots', async (req, res) => {
+  try {
+    const db = await getDB();
+    const { resourceId, date } = req.query;
+    
+    let query = `
+      SELECT 
+        s.*,
+        r.capacity,
+        COUNT(CASE WHEN b.status = 'confirmed' THEN 1 END) as confirmedCount,
+        COUNT(CASE WHEN b.status = 'waitlisted' THEN 1 END) as waitlistCount
+      FROM slots s
+      JOIN resources r ON s.resourceId = r.id
+      LEFT JOIN bookings b ON s.id = b.slotId
+      ${resourceId ? 'WHERE s.resourceId = ?' : ''}
+      GROUP BY s.id
+      ORDER BY s.start ASC
+    `;
+
+    const slots = await db.all(query, resourceId ? [resourceId] : []);
+    res.json(slots);
+  } catch (err) {
+    console.error('Slot list error:', err);
+    res.status(500).json({ error: 'Failed to list slots', code: 'INTERNAL_ERROR' });
+  }
 });
 
 // ----- Admin: Resources CRUD -----
-app.post('/api/admin/resources', (req, res) => {
-  const { name, capacity } = req.body;
-  if (!name || !capacity || capacity < 1) return res.status(400).json({ error: 'Invalid name or capacity' });
-  const id = nanoid(8);
-  const resource = { id, name, capacity: Number(capacity) };
-  resources.push(resource);
-  // generate slots for current week for this resource
-  const now = new Date();
-  const weekStart = startOfWeek(now);
-  const hours = [8, 10, 12, 14, 16, 18];
-  for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
-    for (const h of hours) {
-      const start = new Date(weekStart);
-      start.setDate(start.getDate() + dayOffset);
-      start.setHours(h, 0, 0, 0);
-      const end = new Date(start);
-      end.setHours(h + 2);
-      const slotId = nanoid(10);
-      slots.set(slotId, { id: slotId, resourceId: id, start: start.toISOString(), end: end.toISOString(), bookings: [], waitlist: [], blocked: false });
-    }
+app.post('/api/admin/resources', [
+  authMiddleware,
+  checkRole('admin'),
+  body('name').trim().isLength({ min: 1 }),
+  body('capacity').isInt({ min: 1 })
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid input', details: errors.array() });
   }
-  res.json(resource);
+
+  const db = await getDB();
+  const { name, capacity } = req.body;
+
+  try {
+    await db.transaction(async () => {
+      // Create resource
+      const resourceId = nanoid(8);
+      await db.run(
+        'INSERT INTO resources (id, name, capacity) VALUES (?, ?, ?)',
+        resourceId, name, Number(capacity)
+      );
+
+      // Generate slots for current week
+      const now = new Date();
+      const weekStart = startOfWeek(now);
+      const hours = [8, 10, 12, 14, 16, 18];
+      
+      for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
+        for (const h of hours) {
+          const start = new Date(weekStart);
+          start.setDate(start.getDate() + dayOffset);
+          start.setHours(h, 0, 0, 0);
+          const end = new Date(start);
+          end.setHours(h + 2);
+          
+          await db.run(
+            `INSERT INTO slots (id, resourceId, start, end, blocked) 
+             VALUES (?, ?, ?, ?, ?)`,
+            nanoid(10), resourceId, start.toISOString(), end.toISOString(), false
+          );
+        }
+      }
+
+      const resource = await db.get('SELECT * FROM resources WHERE id = ?', resourceId);
+      await logAudit(req.user.id, 'RESOURCE_CREATED', resourceId, { name, capacity });
+      res.json(resource);
+    });
+  } catch (err) {
+    console.error('Resource create error:', err);
+    res.status(500).json({ error: 'Failed to create resource', code: 'INTERNAL_ERROR' });
+  }
 });
 
-app.put('/api/admin/resources/:id', (req, res) => {
+app.put('/api/admin/resources/:id', [
+  authMiddleware,
+  checkRole('admin'),
+  body('name').optional().trim().isLength({ min: 1 }),
+  body('capacity').optional().isInt({ min: 1 })
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid input', details: errors.array() });
+  }
+
+  const db = await getDB();
   const { id } = req.params;
-  const r = resources.find(r => r.id === id);
-  if (!r) return res.status(404).json({ error: 'Not found' });
   const { name, capacity } = req.body;
-  if (name) r.name = name;
-  if (capacity !== undefined) r.capacity = Math.max(1, Number(capacity));
-  res.json(r);
+
+  try {
+    await db.transaction(async () => {
+      const resource = await db.get('SELECT * FROM resources WHERE id = ?', id);
+      if (!resource) {
+        return res.status(404).json({ error: 'Resource not found', code: 'NOT_FOUND' });
+      }
+
+      if (name || capacity) {
+        await db.run(
+          `UPDATE resources 
+           SET ${name ? 'name = ?,' : ''} ${capacity ? 'capacity = ?' : ''} 
+           WHERE id = ?`,
+          ...[name, capacity, id].filter(x => x !== undefined)
+        );
+
+        await logAudit(req.user.id, 'RESOURCE_UPDATED', id, { name, capacity });
+      }
+
+      const updated = await db.get('SELECT * FROM resources WHERE id = ?', id);
+      res.json(updated);
+    });
+  } catch (err) {
+    console.error('Resource update error:', err);
+    res.status(500).json({ error: 'Failed to update resource', code: 'INTERNAL_ERROR' });
+  }
 });
 
-app.delete('/api/admin/resources/:id', (req, res) => {
+app.delete('/api/admin/resources/:id', [
+  authMiddleware,
+  checkRole('admin')
+], async (req, res) => {
+  const db = await getDB();
   const { id } = req.params;
-  const idx = resources.findIndex(r => r.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Not found' });
-  resources.splice(idx, 1);
-  // remove slots
-  for (const [sid, s] of Array.from(slots.entries())) {
-    if (s.resourceId === id) slots.delete(sid);
+
+  try {
+    await db.transaction(async () => {
+      const resource = await db.get('SELECT * FROM resources WHERE id = ?', id);
+      if (!resource) {
+        return res.status(404).json({ error: 'Resource not found', code: 'NOT_FOUND' });
+      }
+
+      // Delete resource (cascades to slots and bookings)
+      await db.run('DELETE FROM resources WHERE id = ?', id);
+      
+      await logAudit(req.user.id, 'RESOURCE_DELETED', id, { name: resource.name });
+      res.json({ ok: true });
+    });
+  } catch (err) {
+    console.error('Resource delete error:', err);
+    res.status(500).json({ error: 'Failed to delete resource', code: 'INTERNAL_ERROR' });
   }
-  res.json({ ok: true });
 });
 
 // ----- Admin: Usage Stats -----
@@ -262,74 +465,111 @@ app.delete('/api/admin/rules/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/book', (req, res) => {
-  const { userId, slotId } = req.body;
-  const slot = slots.get(slotId);
-  if (!slot) return res.status(404).json({ error: 'Slot not found' });
-  const resource = resources.find(r => r.id === slot.resourceId);
-  if (!resource) return res.status(404).json({ error: 'Resource not found' });
-  if (slot.blocked) return res.status(400).json({ error: 'Slot is blocked by admin schedule' });
-
-  if (slot.bookings.includes(userId)) {
-    return res.json({ status: 'already_booked', slot });
-  }
-  if (slot.waitlist.includes(userId)) {
-    return res.json({ status: 'already_waitlisted', slot });
+app.post('/api/book', bookingLimiter, [
+  body('userId').trim().notEmpty(),
+  body('slotId').trim().notEmpty()
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid input', details: errors.array() });
   }
 
-  if (slot.bookings.length < resource.capacity) {
-    slot.bookings.push(userId);
-    slots.set(slot.id, slot);
-    broadcast('booking_confirmed', { slotId: slot.id, userId });
-    return res.json({ status: 'booked', slot });
-  }
+  try {
+    const { userId, slotId } = req.body;
+    const result = await bookSlot(userId, slotId);
+    
+    // Emit SSE event
+    if (result.status === 'confirmed') {
+      broadcast('booking_confirmed', { slotId, userId });
+    } else if (result.status === 'waitlisted') {
+      broadcast('waitlisted', { slotId, userId, position: result.position });
+    }
 
-  slot.waitlist.push(userId);
-  slots.set(slot.id, slot);
-  broadcast('waitlisted', { slotId: slot.id, userId, position: slot.waitlist.length });
-  return res.json({ status: 'waitlisted', position: slot.waitlist.length, slot });
+    res.json(result);
+  } catch (err) {
+    if (err.code) {
+      res.status(400).json({ error: err.message, code: err.code });
+    } else {
+      console.error('Booking error:', err);
+      res.status(500).json({ error: 'Server error', code: 'INTERNAL_ERROR' });
+    }
+  }
 });
 
-app.post('/api/cancel', (req, res) => {
-  const { userId, slotId } = req.body;
-  const slot = slots.get(slotId);
-  if (!slot) return res.status(404).json({ error: 'Slot not found' });
-  const resource = resources.find(r => r.id === slot.resourceId);
-  if (!resource) return res.status(404).json({ error: 'Resource not found' });
-
-  const wasBooked = slot.bookings.includes(userId);
-  const wasWaitlisted = slot.waitlist.includes(userId);
-
-  if (!wasBooked && !wasWaitlisted) {
-    return res.status(400).json({ error: 'User has no booking or waitlist entry for this slot' });
+app.post('/api/cancel', cancelLimiter, [
+  body('bookingId').trim().notEmpty(),
+  body('actorId').trim().notEmpty()
+], async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ error: 'Invalid input', details: errors.array() });
   }
 
-  if (wasBooked) {
-    slot.bookings = slot.bookings.filter(id => id !== userId);
-  }
-  if (wasWaitlisted) {
-    slot.waitlist = slot.waitlist.filter(id => id !== userId);
-  }
+  try {
+    const { bookingId, actorId } = req.body;
+    const result = await cancelBooking(bookingId, actorId);
+    
+    // Emit appropriate SSE events
+    broadcast('booking_canceled', { bookingId });
+    if (result.promoted) {
+      broadcast('booking_promoted', { userId: result.promoted });
+    }
 
-  // Promote next waitlisted user if capacity available
-  while (slot.bookings.length < resource.capacity && slot.waitlist.length > 0) {
-    const promotedUserId = slot.waitlist.shift();
-    slot.bookings.push(promotedUserId);
-    broadcast('promoted', { slotId: slot.id, userId: promotedUserId });
+    res.json(result);
+  } catch (err) {
+    if (err.code) {
+      res.status(400).json({ error: err.message, code: err.code });
+    } else {
+      console.error('Cancel error:', err);
+      res.status(500).json({ error: 'Server error', code: 'INTERNAL_ERROR' });
+    }
   }
-
-  slots.set(slot.id, slot);
-  broadcast('slot_updated', { slotId: slot.id, slot });
-  res.json({ status: 'cancelled', slot });
 });
 
+// New lightweight status endpoints
+app.get('/api/slots/:id/status', async (req, res) => {
+  try {
+    const status = await getSlotStatus(req.params.id);
+    res.json(status);
+  } catch (err) {
+    if (err.code === 'NOT_FOUND') {
+      res.status(404).json({ error: 'Slot not found' });
+    } else {
+      res.status(500).json({ error: 'Server error' });
+    }
+  }
+});
+
+app.get('/api/slots/:id/waitlist', async (req, res) => {
+  try {
+    const waitlist = await getSlotWaitlist(req.params.id);
+    res.json(waitlist);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Health check
+app.get('/healthz', async (_req, res) => {
+  try {
+    const db = await getDB();
+    await db.get('SELECT 1');
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Database error' });
+  }
+});
+
+// SSE endpoint for real-time updates
 app.get('/api/events', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
 
-  res.write(`event: connected\n` + `data: {"ok":true}\n\n`);
+  const clientId = nanoid(6);
+  res.write(`event: connected\n` + `data: {"ok":true,"clientId":"${clientId}"}\n\n`);
+  
   sseClients.add(res);
   req.on('close', () => {
     sseClients.delete(res);

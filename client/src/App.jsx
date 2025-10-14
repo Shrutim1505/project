@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import Login from './Login.jsx';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 
@@ -113,7 +114,7 @@ export default function App() {
           <div className="tabs" style={{ marginLeft: 16 }}>
             {auth?.user?.role === 'admin' && (
               <button className={`tab ${adminMode ? 'active' : ''}`} onClick={() => setAdminMode(!adminMode)}>
-                {adminMode ? 'Close Admin' : 'Admin'}
+                {adminMode ? 'Close Admin' : ''}
               </button>
             )}
           </div>
@@ -174,7 +175,14 @@ export default function App() {
       </div>
 
       <div className="app-container">
-        {adminMode ? (
+        {!auth ? (
+          <Login
+            onLogin={(a) => {
+              setAuth(a);
+              setSelectedUserId(a.user.id);
+            }}
+          />
+        ) : adminMode ? (
           <div>
             <h3>Admin Panel</h3>
 
